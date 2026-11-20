@@ -1,0 +1,1014 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import sys
+import json
+import datetime
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import docx
+from docx.shared import Mm as mm, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL, WD_ROW_HEIGHT_RULE
+from docx.oxml import OxmlElement, parse_xml
+from docx.oxml.ns import qn, nsdecls
+
+
+def get_desktop_path():
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import windll, wintypes
+
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", wintypes.DWORD),
+                    ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8)
+                ]
+
+            FOLDERID_Desktop = GUID(
+                0xB4BFCC3A, 0xDB2C, 0x424C,
+                (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41)
+            )
+            path_ptr = ctypes.c_wchar_p()
+            res = windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(FOLDERID_Desktop), 0, None, ctypes.byref(path_ptr)
+            )
+            if res == 0 and path_ptr.value:
+                desktop = path_ptr.value
+                windll.ole32.CoTaskMemFree(path_ptr)
+                if os.path.exists(desktop):
+                    return desktop
+        except Exception:
+            pass
+
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            )
+            desktop, _ = winreg.QueryValueEx(key, "Desktop")
+            desktop = os.path.expandvars(desktop)
+            if os.path.exists(desktop):
+                return desktop
+        except Exception:
+            pass
+
+    standart_yol = os.path.join(os.path.expanduser("~"), "Desktop")
+    if os.path.exists(standart_yol):
+        return standart_yol
+    return os.path.expanduser("~")
+
+
+def get_app_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_image_file(base_names):
+    search_dirs = [get_app_dir()]
+    if hasattr(sys, '_MEIPASS'):
+        search_dirs.append(sys._MEIPASS)
+    for folder in search_dirs:
+        for name in base_names:
+            candidate = os.path.join(folder, name)
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def format_currency(val):
+    try:
+        val = float(val)
+    except (ValueError, TypeError):
+        val = 0.0
+    formatted = f"{val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{formatted} ₺"
+
+
+def parse_tr_float(text):
+    if text is None:
+        return None
+    s = str(text).strip().replace("₺", "").replace(" ", "")
+    if not s:
+        return None
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        val = float(s)
+        return val if val >= 0 else None
+    except ValueError:
+        return None
+
+
+def sanitize_filename(name):
+    cleaned = re.sub(r'[\\/*?:"<>|]', "", str(name).strip())
+    cleaned = re.sub(r'\s+', "_", cleaned)
+    return cleaned if cleaned else "Musteri"
+
+
+def set_cell_shading(cell, color_hex):
+    shading = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color_hex}"/>')
+    cell._tc.get_or_add_tcPr().append(shading)
+
+
+def set_cell_margins(cell, top=10, bottom=10, left=45, right=45):
+    tcPr = cell._tc.get_or_add_tcPr()
+    tcMar = OxmlElement('w:tcMar')
+    for m, val in [('top', top), ('bottom', bottom), ('left', left), ('right', right)]:
+        node = OxmlElement(f'w:{m}')
+        node.set(qn('w:w'), str(val))
+        node.set(qn('w:type'), 'dxa')
+        tcMar.append(node)
+    tcPr.append(tcMar)
+
+
+def lock_row_height(row, height_mm):
+    """Word'ün satırları kendi kendine büyütüp 2. sayfaya taşırmasını engeller."""
+    row.height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
+    row.height = mm(height_mm)
+
+
+def write_cell(cell, text, bold=False, size=8.0, align=WD_ALIGN_PARAGRAPH.LEFT, color=None):
+    cell.text = ""
+    p = cell.paragraphs[0]
+    p.alignment = align
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing = 1.0
+    run = p.add_run(str(text))
+    run.bold = bold
+    run.font.size = Pt(size)
+    run.font.name = "Arial"
+    if color:
+        run.font.color.rgb = RGBColor(*color)
+    cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+
+class SahinOtomotivApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Şahin Otomotiv - Servis İş Emri Sihirbazı")
+        self.geometry("860x650")
+        self.minsize(780, 580)
+        self.configure(bg="#F3F4F6")
+
+        self.config_file = os.path.join(get_app_dir(), "sahin_ayarlar.json")
+        self.son_kaydedilen_dosya = None
+
+        self._configure_styles()
+        self.reset_form_data()
+        self._build_layout()
+
+        self.bind("<Return>", self.on_enter_key)
+        self.bind("<Control-Return>", self.on_ctrl_enter_key)
+
+        self.render_step()
+
+    def _configure_styles(self):
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("TFrame", background="#FFFFFF")
+        style.configure("Main.TFrame", background="#F3F4F6")
+        style.configure("Header.TFrame", background="#1E293B")
+        style.configure("HeaderTitle.TLabel", background="#1E293B", foreground="#FFFFFF", font=("Segoe UI", 15, "bold"))
+        style.configure("StepBadge.TLabel", background="#2563EB", foreground="#FFFFFF", font=("Segoe UI", 10, "bold"), padding=(8, 3))
+        style.configure("Question.TLabel", background="#FFFFFF", foreground="#0F172A", font=("Segoe UI", 14, "bold"))
+        style.configure("Hint.TLabel", background="#FFFFFF", foreground="#64748B", font=("Segoe UI", 9, "italic"))
+        style.configure("Info.TLabel", background="#FFFFFF", foreground="#1E293B", font=("Segoe UI", 11))
+        style.configure("TotalMedium.TLabel", background="#F1F5F9", foreground="#0F172A", font=("Segoe UI", 13, "bold"), padding=8)
+        style.configure("TotalBig.TLabel", background="#EFF6FF", foreground="#1D4ED8", font=("Segoe UI", 15, "bold"), padding=10)
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"), background="#E2E8F0", foreground="#0F172A")
+        style.configure("Treeview", font=("Segoe UI", 9), rowheight=24)
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), background="#2563EB", foreground="#FFFFFF", padding=(16, 8))
+        style.map("Primary.TButton", background=[("active", "#1D4ED8")])
+        style.configure("Secondary.TButton", font=("Segoe UI", 10), padding=(14, 8))
+        style.configure("Success.TButton", font=("Segoe UI", 11, "bold"), background="#16A34A", foreground="#FFFFFF", padding=(18, 9))
+        style.map("Success.TButton", background=[("active", "#15803D")])
+
+    def reset_form_data(self):
+        bugun = datetime.date.today().strftime("%d.%m.%Y")
+        self.is_emri_no = self.peek_next_order_no()
+        self.data = {
+            "musteri_adi": "",
+            "telefon": "",
+            "adres": "",
+            "arac_model": "",
+            "teslim_tarihi": bugun,
+            "sasi_no": "",
+            "km": "",
+            "sikayet": "",
+            "yapilan_islemler": "",
+            "islem_turleri": {
+                "Periyodik Bakım": False,
+                "Arıza Onarım": False,
+                "Kontrol": False,
+                "Diğer": False
+            },
+            "parcalar": [],
+            "iscilik": 0.0
+        }
+        self.current_step = 1
+        self.part_substep = 0
+        self.temp_part = {}
+        self.last_part_msg = ""
+
+    def peek_next_order_no(self):
+        last_no = 0
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    last_no = int(cfg.get("last_order_no", 0))
+            except Exception:
+                last_no = 0
+        return f"{last_no + 1:04d}"
+
+    def increment_and_save_order_no(self):
+        current_int = int(self.is_emri_no)
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump({"last_order_no": current_int}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _build_layout(self):
+        header = ttk.Frame(self, style="Header.TFrame", padding=(20, 14))
+        header.pack(fill="x")
+
+        title_lbl = ttk.Label(header, text="ŞAHİN OTOMOTİV — SERVİS İŞ EMRİ", style="HeaderTitle.TLabel")
+        title_lbl.pack(side="left")
+
+        self.order_badge = ttk.Label(header, text=f"İş Emri No: {self.is_emri_no}", style="StepBadge.TLabel")
+        self.order_badge.pack(side="right")
+
+        self.progress = ttk.Progressbar(self, orient="horizontal", mode="determinate", maximum=14)
+        self.progress.pack(fill="x", padx=20, pady=(12, 0))
+
+        self.card = ttk.Frame(self, style="TFrame", padding=25)
+        self.card.pack(fill="both", expand=True, padx=20, pady=12)
+
+        self.footer = ttk.Frame(self, style="Main.TFrame", padding=(20, 8))
+        self.footer.pack(fill="x", side="bottom")
+
+        self.btn_prev = ttk.Button(self.footer, text="← Geri", style="Secondary.TButton", command=self.prev_step)
+        self.btn_prev.pack(side="left")
+
+        self.step_counter_lbl = ttk.Label(self.footer, text="Adım 1 / 14", background="#F3F4F6", foreground="#475569", font=("Segoe UI", 10, "bold"))
+        self.step_counter_lbl.pack(side="left", padx=20)
+
+        self.btn_next = ttk.Button(self.footer, text="Sonraki (Enter) →", style="Primary.TButton", command=self.next_step)
+        self.btn_next.pack(side="right")
+
+    def clear_card(self):
+        for widget in self.card.winfo_children():
+            widget.destroy()
+
+    def render_step(self):
+        self.clear_card()
+        self.order_badge.config(text=f"İş Emri No: {self.is_emri_no}")
+        self.progress["value"] = self.current_step
+        self.step_counter_lbl.config(text=f"Adım {self.current_step} / 14")
+
+        if self.current_step == 1 and self.part_substep == 0:
+            self.btn_prev.state(["disabled"])
+        else:
+            self.btn_prev.state(["!disabled"])
+
+        if self.current_step == 14:
+            self.btn_next.pack_forget()
+        else:
+            if not self.btn_next.winfo_ismapped():
+                self.btn_next.pack(side="right")
+            self.btn_next.config(text="Sonraki (Enter) →")
+
+        single_line_steps = {
+            1: ("1. Firma / Müşteri adı nedir?", "musteri_adi", "Zorunlu alan (Örn: Ahmet Yılmaz veya ABC Lojistik)", True),
+            2: ("2. Telefon numarası nedir?", "telefon", "Zorunlu alan (Örn: 0532 123 45 67)", True),
+            3: ("3. Adres nedir?", "adres", "İsteğe bağlı — Boş geçmek için doğrudan Enter'a basabilirsiniz.", False),
+            4: ("4. Araç marka / model nedir?", "arac_model", "Müşteri tablosunun sağ 1. satırına yazılır (Örn: Fiat Egea 1.6 Multijet - 07 ABC 123)", False),
+            5: ("5. Teslim tarihi nedir?", "teslim_tarihi", "Bugünün tarihi varsayılan olarak önerilmiştir.", False),
+            6: ("6. Şasi numarası nedir?", "sasi_no", "Müşteri tablosunun sağ 3. satırına yazılır.", False),
+            7: ("7. KM bilgisi nedir?", "km", "Müşteri tablosunun sağ 4. satırına yazılır (Örn: 145.000)", False),
+        }
+
+        if self.current_step in single_line_steps:
+            q_text, key, hint, is_req = single_line_steps[self.current_step]
+            ttk.Label(self.card, text=q_text, style="Question.TLabel").pack(anchor="w", pady=(0, 6))
+            ttk.Label(self.card, text=hint, style="Hint.TLabel").pack(anchor="w", pady=(0, 14))
+
+            self.active_var = tk.StringVar(value=self.data[key])
+            entry = ttk.Entry(self.card, textvariable=self.active_var, font=("Segoe UI", 13), width=55)
+            entry.pack(anchor="w", ipady=5, fill="x")
+            entry.focus_set()
+            entry.icursor(tk.END)
+            self.active_widget = entry
+
+        elif self.current_step == 8:
+            ttk.Label(self.card, text="8. Müşteri şikâyeti / talebi nedir?", style="Question.TLabel").pack(anchor="w", pady=(0, 6))
+            ttk.Label(self.card, text="İsteğe bağlı. (Enter: Sonraki adıma geçer | Alt satıra inmek için: Shift+Enter)", style="Hint.TLabel").pack(anchor="w", pady=(0, 10))
+
+            txt = tk.Text(self.card, font=("Segoe UI", 11), height=8, wrap="word", relief="solid", bd=1, padx=8, pady=8)
+            txt.pack(fill="both", expand=True)
+            txt.insert("1.0", self.data["sikayet"])
+            txt.focus_set()
+            txt.bind("<Return>", self._text_enter_handler)
+            txt.bind("<Shift-Return>", lambda e: None)
+            self.active_widget = txt
+
+        elif self.current_step == 9:
+            ttk.Label(self.card, text="9. Yapılan işlemler nelerdir?", style="Question.TLabel").pack(anchor="w", pady=(0, 6))
+            ttk.Label(self.card, text="İşlem türlerini işaretleyin ve yapılan işlemleri yazın. (Enter: Sonraki adım | Shift+Enter: Yeni satır)", style="Hint.TLabel").pack(anchor="w", pady=(0, 10))
+
+            chk_frame = ttk.Frame(self.card, style="TFrame")
+            chk_frame.pack(fill="x", pady=(0, 12))
+
+            self.chk_vars = {}
+            for tur in ["Periyodik Bakım", "Arıza Onarım", "Kontrol", "Diğer"]:
+                var = tk.BooleanVar(value=self.data["islem_turleri"].get(tur, False))
+                self.chk_vars[tur] = var
+                cb = tk.Checkbutton(
+                    chk_frame, text=tur, variable=var,
+                    font=("Segoe UI", 11, "bold"), bg="#FFFFFF", activebackground="#FFFFFF",
+                    cursor="hand2"
+                )
+                cb.pack(side="left", padx=(0, 20))
+
+            txt = tk.Text(self.card, font=("Segoe UI", 11), height=7, wrap="word", relief="solid", bd=1, padx=8, pady=8)
+            txt.pack(fill="both", expand=True)
+            txt.insert("1.0", self.data["yapilan_islemler"])
+            txt.focus_set()
+            txt.bind("<Return>", self._text_enter_handler)
+            txt.bind("<Shift-Return>", lambda e: None)
+            self.active_widget = txt
+
+        elif self.current_step == 10:
+            self._render_parts_step()
+
+        elif self.current_step == 11:
+            parca_toplam = sum(p["tutar"] for p in self.data["parcalar"])
+            ttk.Label(self.card, text="11. Yedek Parça Toplamı (Otomatik Hesaplandı)", style="Question.TLabel").pack(anchor="w", pady=(0, 8))
+            ttk.Label(self.card, text=f"Toplam {len(self.data['parcalar'])} kalem yedek parça girildi.", style="Info.TLabel").pack(anchor="w", pady=(0, 15))
+            ttk.Label(self.card, text=f"YEDEK PARÇA TOPLAMI: {format_currency(parca_toplam)}", style="TotalBig.TLabel").pack(anchor="w", pady=10)
+            ttk.Label(self.card, text="Devam etmek için Enter tuşuna veya 'Sonraki' butonuna basın.", style="Hint.TLabel").pack(anchor="w", pady=(15, 0))
+            self.focus_set()
+
+        elif self.current_step == 12:
+            ttk.Label(self.card, text="12. İşçilik ne kadar? (₺)", style="Question.TLabel").pack(anchor="w", pady=(0, 6))
+            ttk.Label(self.card, text="Sadece sayı giriniz (Örn: 1500 veya 1250,50). Boş bırakırsanız 0,00 ₺ kabul edilir.", style="Hint.TLabel").pack(anchor="w", pady=(0, 14))
+
+            mevcut_iscilik = ""
+            if self.data["iscilik"] > 0:
+                mevcut_iscilik = str(self.data["iscilik"]).replace(".", ",")
+
+            self.active_var = tk.StringVar(value=mevcut_iscilik)
+            entry = ttk.Entry(self.card, textvariable=self.active_var, font=("Segoe UI", 13), width=30)
+            entry.pack(anchor="w", ipady=5)
+            entry.focus_set()
+            entry.icursor(tk.END)
+            self.active_widget = entry
+
+        elif self.current_step == 13:
+            parca_toplam = sum(p["tutar"] for p in self.data["parcalar"])
+            iscilik = self.data["iscilik"]
+            genel_toplam = round(parca_toplam + iscilik, 2)
+            kdv_li_fiyat = round(genel_toplam * 1.20, 2)
+
+            ttk.Label(self.card, text="13. Genel Toplam ve KDV (%20)'li Fiyat", style="Question.TLabel").pack(anchor="w", pady=(0, 15))
+
+            summary_box = ttk.Frame(self.card, style="TFrame")
+            summary_box.pack(fill="x", pady=5)
+
+            ttk.Label(summary_box, text=f"• Yedek Parça Toplamı :   {format_currency(parca_toplam)}", style="Info.TLabel").pack(anchor="w", pady=3)
+            ttk.Label(summary_box, text=f"• İşçilik Toplamı            :   {format_currency(iscilik)}", style="Info.TLabel").pack(anchor="w", pady=3)
+            ttk.Label(summary_box, text=f"GENEL TOPLAM :   {format_currency(genel_toplam)}", style="TotalMedium.TLabel").pack(anchor="w", pady=(10, 6))
+            ttk.Label(summary_box, text=f"KDV (%20)'Lİ FİYAT :   {format_currency(kdv_li_fiyat)}", style="TotalBig.TLabel").pack(anchor="w", pady=(4, 10))
+
+            ttk.Label(self.card, text="Özet ekranına geçmek için Enter tuşuna basın.", style="Hint.TLabel").pack(anchor="w", pady=(10, 0))
+            self.focus_set()
+
+        elif self.current_step == 14:
+            self._render_summary_step()
+
+    def _render_parts_step(self):
+        idx = len(self.data["parcalar"]) + 1
+
+        if self.last_part_msg:
+            msg_lbl = tk.Label(self.card, text=self.last_part_msg, bg="#DCFCE7", fg="#166534", font=("Segoe UI", 10, "bold"), padx=10, pady=5)
+            msg_lbl.pack(fill="x", pady=(0, 10))
+
+        if self.part_substep == 0:
+            q_title = f"10. Kullanılan Yedek Parçalar — {idx}. parça nedir?"
+            hint = "Örn: Hava filtresi. (Parça eklemeyi bitirip 11. adıma geçmek için BOŞ bırakıp Enter'a basın)"
+            default_val = ""
+        elif self.part_substep == 1:
+            q_title = f"{idx}. Parça ({self.temp_part.get('ad')}) → Parça kodu nedir?"
+            hint = "İsteğe bağlı. Boş geçmek için doğrudan Enter'a basabilirsiniz."
+            default_val = ""
+        elif self.part_substep == 2:
+            q_title = f"{idx}. Parça ({self.temp_part.get('ad')}) → Adet kaç?"
+            hint = "Sadece sayı giriniz (Örn: 1, 2 veya 4,5). Varsayılan: 1"
+            default_val = "1"
+        elif self.part_substep == 3:
+            q_title = f"{idx}. Parça ({self.temp_part.get('ad')}) → Birim fiyat nedir? (₺)"
+            hint = "Sadece sayı giriniz (Örn: 450 veya 1250,50)"
+            default_val = ""
+
+        ttk.Label(self.card, text=q_title, style="Question.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Label(self.card, text=hint, style="Hint.TLabel").pack(anchor="w", pady=(0, 10))
+
+        input_row = ttk.Frame(self.card, style="TFrame")
+        input_row.pack(fill="x", pady=(0, 12))
+
+        self.active_var = tk.StringVar(value=default_val)
+        entry = ttk.Entry(input_row, textvariable=self.active_var, font=("Segoe UI", 12), width=40)
+        entry.pack(side="left", ipady=4)
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
+        self.active_widget = entry
+
+        if len(self.data["parcalar"]) > 0:
+            del_btn = ttk.Button(input_row, text="Son Parçayı Sil", style="Secondary.TButton", command=self.delete_last_part)
+            del_btn.pack(side="right")
+
+        cols = ("sira", "ad", "kod", "adet", "fiyat", "tutar")
+        tree_frame = ttk.Frame(self.card, style="TFrame")
+        tree_frame.pack(fill="both", expand=True)
+
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=8)
+        tree.heading("sira", text="Sıra No")
+        tree.heading("ad", text="Parça Adı")
+        tree.heading("kod", text="Parça Kodu")
+        tree.heading("adet", text="Adet")
+        tree.heading("fiyat", text="Birim Fiyat")
+        tree.heading("tutar", text="Tutar")
+
+        tree.column("sira", width=60, anchor="center")
+        tree.column("ad", width=240, anchor="w")
+        tree.column("kod", width=120, anchor="center")
+        tree.column("adet", width=70, anchor="center")
+        tree.column("fiyat", width=110, anchor="e")
+        tree.column("tutar", width=120, anchor="e")
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for i, p in enumerate(self.data["parcalar"], start=1):
+            adet_str = f"{p['adet']:g}".replace(".", ",")
+            tree.insert("", "end", values=(
+                i, p["ad"], p["kod"], adet_str,
+                format_currency(p["fiyat"]), format_currency(p["tutar"])
+            ))
+
+        ara_toplam = sum(p["tutar"] for p in self.data["parcalar"])
+        ttk.Label(
+            self.card,
+            text=f"Eklenen Parça Sayısı: {len(self.data['parcalar'])} / 30   |   Ara Toplam: {format_currency(ara_toplam)}",
+            style="Info.TLabel"
+        ).pack(anchor="e", pady=(8, 0))
+
+    def delete_last_part(self):
+        if self.data["parcalar"]:
+            silinen = self.data["parcalar"].pop()
+            self.part_substep = 0
+            self.temp_part = {}
+            self.last_part_msg = f"'{silinen['ad']}' listeden silindi."
+            self.render_step()
+
+    def _render_summary_step(self):
+        ttk.Label(self.card, text="14. İş Emri Özeti ve Kaydetme", style="Question.TLabel").pack(anchor="w", pady=(0, 8))
+
+        summary_text = tk.Text(self.card, font=("Consolas", 10), height=14, wrap="word", bg="#F8FAFC", relief="solid", bd=1, padx=10, pady=10)
+        summary_text.pack(fill="both", expand=True, pady=(0, 12))
+
+        islem_secilenler = [k for k, v in self.data["islem_turleri"].items() if v]
+        islem_str = ", ".join(islem_secilenler) if islem_secilenler else "Belirtilmedi"
+        parca_toplam = sum(p["tutar"] for p in self.data["parcalar"])
+        genel_toplam = round(parca_toplam + self.data["iscilik"], 2)
+        kdv_li_fiyat = round(genel_toplam * 1.20, 2)
+
+        lines = [
+            f"İŞ EMRİ NO           : {self.is_emri_no}",
+            f"FİRMA / MÜŞTERİ ADI  : {self.data['musteri_adi']}",
+            f"TELEFON              : {self.data['telefon']}",
+            f"ADRES                : {self.data['adres'] or '-'}",
+            f"ARAÇ MARKA / MODEL   : {self.data['arac_model'] or '-'}",
+            f"TESLİM TARİHİ        : {self.data['teslim_tarihi'] or '-'}",
+            f"ŞASİ NO              : {self.data['sasi_no'] or '-'}",
+            f"KM                   : {self.data['km'] or '-'}",
+            "-" * 68,
+            f"MÜŞTERİ ŞİKÂYETİ     : {self.data['sikayet'] or '-'}",
+            f"İŞLEM KATEGORİLERİ   : {islem_str}",
+            f"YAPILAN İŞLEMLER     : {self.data['yapilan_islemler'] or '-'}",
+            "-" * 68,
+            f"YEDEK PARÇALAR ({len(self.data['parcalar'])} Kalem):"
+        ]
+        for i, p in enumerate(self.data["parcalar"], start=1):
+            adet_s = f"{p['adet']:g}".replace(".", ",")
+            lines.append(f"  {i:2d}. {p['ad']} (Kod: {p['kod'] or '-'}) | {adet_s} Adet x {format_currency(p['fiyat'])} = {format_currency(p['tutar'])}")
+
+        lines.extend([
+            "-" * 68,
+            f"YEDEK PARÇA TOPLAMI  : {format_currency(parca_toplam)}",
+            f"İŞÇİLİK TOPLAMI      : {format_currency(self.data['iscilik'])}",
+            f"GENEL TOPLAM         : {format_currency(genel_toplam)}",
+            f"KDV (%20)'Lİ FİYAT   : {format_currency(kdv_li_fiyat)}"
+        ])
+
+        summary_text.insert("1.0", "\n".join(lines))
+        summary_text.config(state="disabled")
+
+        btn_bar = ttk.Frame(self.card, style="TFrame")
+        btn_bar.pack(fill="x", pady=(4, 0))
+
+        btn_save = ttk.Button(btn_bar, text="💾 Word Olarak Masaüstüne Kaydet (Enter)", style="Success.TButton", command=self.save_to_word)
+        btn_save.pack(side="left", padx=(0, 10))
+
+        btn_edit = ttk.Button(btn_bar, text="✏️ Düzenle", style="Secondary.TButton", command=self.open_edit_dialog)
+        btn_edit.pack(side="left", padx=(0, 10))
+
+        btn_reset = ttk.Button(btn_bar, text="🔄 Baştan Başla", style="Secondary.TButton", command=self.restart_wizard)
+        btn_reset.pack(side="left")
+
+        self.btn_open_file = ttk.Button(btn_bar, text="📄 Dosyayı Aç", style="Primary.TButton", command=self.open_saved_file)
+        if self.son_kaydedilen_dosya and os.path.exists(self.son_kaydedilen_dosya):
+            self.btn_open_file.pack(side="right")
+
+    def _text_enter_handler(self, event):
+        self.next_step()
+        return "break"
+
+    def on_enter_key(self, event):
+        if isinstance(event.widget, tk.Text):
+            return
+        if self.current_step == 14:
+            self.save_to_word()
+        else:
+            self.next_step()
+
+    def on_ctrl_enter_key(self, event):
+        self.next_step()
+
+    def next_step(self):
+        step_keys = {
+            1: ("musteri_adi", True, "Firma / Müşteri adı zorunludur! Lütfen boş bırakmayınız."),
+            2: ("telefon", True, "Telefon numarası zorunludur! Lütfen boş bırakmayınız."),
+            3: ("adres", False, ""),
+            4: ("arac_model", False, ""),
+            5: ("teslim_tarihi", False, ""),
+            6: ("sasi_no", False, ""),
+            7: ("km", False, ""),
+        }
+
+        if self.current_step in step_keys:
+            key, req, err_msg = step_keys[self.current_step]
+            val = self.active_var.get().strip()
+            if req and not val:
+                messagebox.showwarning("Zorunlu Alan", err_msg)
+                return
+            self.data[key] = val
+            self.current_step += 1
+            self.render_step()
+            return
+
+        if self.current_step == 8:
+            self.data["sikayet"] = self.active_widget.get("1.0", "end-1c").strip()
+            self.current_step += 1
+            self.render_step()
+            return
+
+        if self.current_step == 9:
+            self.data["yapilan_islemler"] = self.active_widget.get("1.0", "end-1c").strip()
+            for k, var in self.chk_vars.items():
+                self.data["islem_turleri"][k] = var.get()
+            self.current_step += 1
+            self.part_substep = 0
+            self.last_part_msg = ""
+            self.render_step()
+            return
+
+        if self.current_step == 10:
+            val = self.active_var.get().strip()
+            if self.part_substep == 0:
+                if not val:
+                    self.current_step = 11
+                    self.render_step()
+                    return
+                self.temp_part = {"ad": val}
+                self.part_substep = 1
+                self.render_step()
+                return
+
+            elif self.part_substep == 1:
+                self.temp_part["kod"] = val
+                self.part_substep = 2
+                self.render_step()
+                return
+
+            elif self.part_substep == 2:
+                adet = parse_tr_float(val)
+                if adet is None or adet <= 0:
+                    messagebox.showwarning("Geçersiz Giriş", "Lütfen geçerli bir adet sayısı giriniz (Örn: 1 veya 2,5).")
+                    return
+                self.temp_part["adet"] = adet
+                self.part_substep = 3
+                self.render_step()
+                return
+
+            elif self.part_substep == 3:
+                fiyat = parse_tr_float(val)
+                if fiyat is None:
+                    messagebox.showwarning("Geçersiz Giriş", "Lütfen geçerli bir birim fiyat giriniz (Örn: 750 veya 1250,50).")
+                    return
+                self.temp_part["fiyat"] = fiyat
+                self.temp_part["tutar"] = round(self.temp_part["adet"] * fiyat, 2)
+                self.data["parcalar"].append(self.temp_part.copy())
+
+                eklenen_no = len(self.data["parcalar"])
+                self.last_part_msg = (
+                    f"✓ {eklenen_no}. Parça Eklendi: {self.temp_part['ad']} "
+                    f"({self.temp_part['adet']:g} Adet × {format_currency(fiyat)} = {format_currency(self.temp_part['tutar'])})"
+                )
+                self.temp_part = {}
+                self.part_substep = 0
+
+                if len(self.data["parcalar"]) >= 30:
+                    messagebox.showinfo("Bilgi", "Maksimum 30 yedek parça sınırına ulaşıldı. 11. adıma geçiliyor.")
+                    self.current_step = 11
+                self.render_step()
+                return
+
+        if self.current_step == 11:
+            self.current_step = 12
+            self.render_step()
+            return
+
+        if self.current_step == 12:
+            val = self.active_var.get().strip()
+            if not val:
+                self.data["iscilik"] = 0.0
+            else:
+                iscilik = parse_tr_float(val)
+                if iscilik is None:
+                    messagebox.showwarning("Geçersiz Giriş", "İşçilik alanına sadece sayı girilebilir (Örn: 1500 veya 1250,50).")
+                    return
+                self.data["iscilik"] = iscilik
+            self.current_step = 13
+            self.render_step()
+            return
+
+        if self.current_step == 13:
+            self.current_step = 14
+            self.render_step()
+            return
+
+    def prev_step(self):
+        if self.current_step == 10 and self.part_substep > 0:
+            self.part_substep -= 1
+            self.render_step()
+            return
+
+        if self.current_step > 1:
+            self.current_step -= 1
+            if self.current_step == 10:
+                self.part_substep = 0
+            self.render_step()
+
+    def open_edit_dialog(self):
+        win = tk.Toplevel(self)
+        win.title("Adım Seç ve Düzenle")
+        win.geometry("420x460")
+        win.transient(self)
+        win.grab_set()
+
+        ttk.Label(win, text="Düzenlemek istediğiniz adımı seçin:", font=("Segoe UI", 11, "bold")).pack(padx=15, pady=(15, 8), anchor="w")
+
+        listbox = tk.Listbox(win, font=("Segoe UI", 10), height=14)
+        listbox.pack(fill="both", expand=True, padx=15, pady=5)
+
+        adimlar = [
+            "1. Firma / Müşteri Adı",
+            "2. Telefon Numarası",
+            "3. Adres",
+            "4. Araç Marka / Model",
+            "5. Teslim Tarihi",
+            "6. Şasi Numarası",
+            "7. KM Bilgisi",
+            "8. Müşteri Şikâyeti / Talebi",
+            "9. Yapılan İşlemler ve Onay Kutuları",
+            "10. Kullanılan Yedek Parçalar (Ekle / Sil)",
+            "11. Yedek Parça Toplamı",
+            "12. İşçilik Ücreti",
+            "13. Genel Toplam ve KDV (%20)'li Fiyat"
+        ]
+        for a in adimlar:
+            listbox.insert(tk.END, a)
+
+        def go_selected():
+            sel = listbox.curselection()
+            if sel:
+                self.current_step = sel[0] + 1
+                self.part_substep = 0
+                win.destroy()
+                self.render_step()
+
+        ttk.Button(win, text="Seçilen Adıma Git", style="Primary.TButton", command=go_selected).pack(pady=12)
+
+    def restart_wizard(self):
+        if messagebox.askyesno("Baştan Başla", "Mevcut form verileri temizlenip 1. adımdan yeniden başlanacak. Onaylıyor musunuz?"):
+            self.son_kaydedilen_dosya = None
+            self.reset_form_data()
+            self.render_step()
+
+    def open_saved_file(self):
+        if self.son_kaydedilen_dosya and os.path.exists(self.son_kaydedilen_dosya):
+            try:
+                os.startfile(self.son_kaydedilen_dosya)
+            except Exception as e:
+                messagebox.showerror("Hata", f"Dosya açılamadı:\n{e}")
+
+    def save_to_word(self):
+        try:
+            doc = docx.Document()
+
+            # Yazıcıların "Kenar boşluğu dar" hatası vermemesi için güvenli A4 marjları (8mm - 10mm)
+            # Net Kullanılabilir Yükseklik: 297 - 16 = 281 mm | Net Genişlik: 210 - 20 = 190 mm
+            section = doc.sections[0]
+            section.page_width = mm(210)
+            section.page_height = mm(297)
+            section.top_margin = mm(8)
+            section.bottom_margin = mm(8)
+            section.left_margin = mm(10)
+            section.right_margin = mm(10)
+            section.header_distance = mm(5)
+            section.footer_distance = mm(5)
+
+            normal_style = doc.styles["Normal"]
+            normal_style.font.name = "Arial"
+            normal_style.font.size = Pt(8)
+
+            # 1. ÜST BAŞLIK TABLOSU (Yükseklik: 6.5 mm)
+            hdr_table = doc.add_table(rows=1, cols=3)
+            hdr_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+            hdr_widths = [mm(65), mm(65), mm(60)]
+            lock_row_height(hdr_table.rows[0], 6.5)
+            for cell, w in zip(hdr_table.rows[0].cells, hdr_widths):
+                cell.width = w
+                set_cell_margins(cell, top=10, bottom=10, left=35, right=35)
+
+            c_left = hdr_table.rows[0].cells[0]
+            write_cell(c_left, "ŞAHİN OTOMOTİV", bold=True, size=13, align=WD_ALIGN_PARAGRAPH.LEFT, color=(180, 0, 0))
+            write_cell(hdr_table.rows[0].cells[1], "SERVİS İŞ EMRİ", bold=True, size=13, align=WD_ALIGN_PARAGRAPH.CENTER)
+            write_cell(hdr_table.rows[0].cells[2], f"İş Emri No: {self.is_emri_no}", bold=True, size=10, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+            p_spacer = doc.add_paragraph()
+            p_spacer.paragraph_format.space_before = Pt(1)
+            p_spacer.paragraph_format.space_after = Pt(1)
+            p_spacer.paragraph_format.line_spacing = Pt(1)
+
+            # 2. MÜŞTERİ VE ARAÇ BİLGİLERİ TABLOSU (4 x 5.2 mm = 20.8 mm)
+            cust_table = doc.add_table(rows=4, cols=4)
+            cust_table.style = "Table Grid"
+            cust_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+            cust_rows_data = [
+                ("FİRMA / MÜŞTERİ ADI", self.data["musteri_adi"], "ARAÇ MARKA / MODEL", self.data["arac_model"]),
+                ("TELEFON", self.data["telefon"], "TESLİM TARİHİ", self.data["teslim_tarihi"]),
+                ("ADRES", self.data["adres"], "ŞASİ NO", self.data["sasi_no"]),
+                ("", "", "KM", self.data["km"])
+            ]
+            cust_widths = [mm(38), mm(62), mm(38), mm(52)]
+
+            for r_idx, (l_lbl, l_val, r_lbl, r_val) in enumerate(cust_rows_data):
+                row = cust_table.rows[r_idx]
+                lock_row_height(row, 5.2)
+                for c_idx, w in enumerate(cust_widths):
+                    row.cells[c_idx].width = w
+                    set_cell_margins(row.cells[c_idx], top=10, bottom=10, left=45, right=45)
+
+                if l_lbl:
+                    set_cell_shading(row.cells[0], "F1F5F9")
+                set_cell_shading(row.cells[2], "F1F5F9")
+
+                write_cell(row.cells[0], l_lbl, bold=True, size=8)
+                write_cell(row.cells[1], l_val, bold=False, size=8.5)
+                write_cell(row.cells[2], r_lbl, bold=True, size=8)
+                write_cell(row.cells[3], r_val, bold=False, size=8.5)
+
+            p_sp2 = doc.add_paragraph()
+            p_sp2.paragraph_format.space_before = Pt(1)
+            p_sp2.paragraph_format.space_after = Pt(1)
+            p_sp2.paragraph_format.line_spacing = Pt(1)
+
+            # 3. MÜŞTERİ ŞİKÂYETİ VE YAPILAN İŞLEMLER (Toplam: 31.6 mm)
+            work_table = doc.add_table(rows=4, cols=1)
+            work_table.style = "Table Grid"
+            work_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+            for r in work_table.rows:
+                r.cells[0].width = mm(190)
+                set_cell_margins(r.cells[0], top=10, bottom=10, left=50, right=50)
+
+            lock_row_height(work_table.rows[0], 4.8)
+            set_cell_shading(work_table.rows[0].cells[0], "E2E8F0")
+            write_cell(work_table.rows[0].cells[0], "MÜŞTERİ ŞİKÂYETİ / TALEBİ", bold=True, size=8)
+
+            lock_row_height(work_table.rows[1], 11.0)
+            write_cell(work_table.rows[1].cells[0], self.data["sikayet"] or " ", bold=False, size=8)
+            work_table.rows[1].cells[0].vertical_alignment = WD_ALIGN_VERTICAL.TOP
+
+            chk_items = []
+            for label in ["Periyodik Bakım", "Arıza Onarım", "Kontrol", "Diğer"]:
+                mark = "☑" if self.data["islem_turleri"].get(label) else "☐"
+                chk_items.append(f"{mark} {label}")
+            chk_line = "    ".join(chk_items)
+
+            lock_row_height(work_table.rows[2], 4.8)
+            set_cell_shading(work_table.rows[2].cells[0], "E2E8F0")
+            write_cell(work_table.rows[2].cells[0], f"YAPILAN İŞLEMLER        {chk_line}", bold=True, size=8)
+
+            lock_row_height(work_table.rows[3], 11.0)
+            write_cell(work_table.rows[3].cells[0], self.data["yapilan_islemler"] or " ", bold=False, size=8)
+            work_table.rows[3].cells[0].vertical_alignment = WD_ALIGN_VERTICAL.TOP
+
+            p_sp3 = doc.add_paragraph()
+            p_sp3.paragraph_format.space_before = Pt(1)
+            p_sp3.paragraph_format.space_after = Pt(1)
+            p_sp3.paragraph_format.line_spacing = Pt(1)
+
+            # 4. KULLANILAN YEDEK PARÇALAR TABLOSU (Başlıklar 9.2 mm + 30 x 4.4 mm = 141.2 mm)
+            parts_table = doc.add_table(rows=32, cols=6)
+            parts_table.style = "Table Grid"
+            parts_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+            p_widths = [mm(14), mm(74), mm(30), mm(16), mm(28), mm(28)]
+
+            lock_row_height(parts_table.rows[0], 4.6)
+            top_cell = parts_table.rows[0].cells[0]
+            for c in parts_table.rows[0].cells[1:]:
+                top_cell.merge(c)
+            set_cell_shading(top_cell, "CBD5E1")
+            set_cell_margins(top_cell, top=8, bottom=8, left=40, right=40)
+            write_cell(top_cell, "KULLANILAN YEDEK PARÇALAR", bold=True, size=8, align=WD_ALIGN_PARAGRAPH.CENTER)
+
+            headers = ["Sıra No", "Parça Adı", "Parça Kodu", "Adet", "Birim Fiyat", "Tutar"]
+            hdr_row = parts_table.rows[1]
+            lock_row_height(hdr_row, 4.6)
+            for idx, text in enumerate(headers):
+                c = hdr_row.cells[idx]
+                c.width = p_widths[idx]
+                set_cell_shading(c, "F1F5F9")
+                set_cell_margins(c, top=8, bottom=8, left=35, right=35)
+                write_cell(c, text, bold=True, size=7.5, align=WD_ALIGN_PARAGRAPH.CENTER)
+
+            for i in range(30):
+                row = parts_table.rows[i + 2]
+                lock_row_height(row, 4.4)
+                for c_idx, w in enumerate(p_widths):
+                    row.cells[c_idx].width = w
+                    set_cell_margins(row.cells[c_idx], top=4, bottom=4, left=35, right=35)
+
+                write_cell(row.cells[0], str(i + 1), bold=False, size=7.5, align=WD_ALIGN_PARAGRAPH.CENTER)
+
+                if i < len(self.data["parcalar"]):
+                    p = self.data["parcalar"][i]
+                    adet_str = f"{p['adet']:g}".replace(".", ",")
+                    write_cell(row.cells[1], p["ad"], size=7.5, align=WD_ALIGN_PARAGRAPH.LEFT)
+                    write_cell(row.cells[2], p["kod"], size=7.5, align=WD_ALIGN_PARAGRAPH.CENTER)
+                    write_cell(row.cells[3], adet_str, size=7.5, align=WD_ALIGN_PARAGRAPH.CENTER)
+                    write_cell(row.cells[4], format_currency(p["fiyat"]), size=7.5, align=WD_ALIGN_PARAGRAPH.RIGHT)
+                    write_cell(row.cells[5], format_currency(p["tutar"]), size=7.5, align=WD_ALIGN_PARAGRAPH.RIGHT)
+                else:
+                    for empty_idx in range(1, 6):
+                        write_cell(row.cells[empty_idx], "", size=7.5)
+
+            p_sp4 = doc.add_paragraph()
+            p_sp4.paragraph_format.space_before = Pt(1)
+            p_sp4.paragraph_format.space_after = Pt(1)
+            p_sp4.paragraph_format.line_spacing = Pt(1)
+
+            # 5. ALT BÖLÜM TABLOSU (4 x 5.2 mm = 20.8 mm)
+            bottom_table = doc.add_table(rows=4, cols=4)
+            bottom_table.style = "Table Grid"
+            bottom_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+            b_widths = [mm(72), mm(54), mm(36), mm(28)]
+
+            for r in bottom_table.rows:
+                lock_row_height(r, 5.2)
+                for c_idx, w in enumerate(b_widths):
+                    r.cells[c_idx].width = w
+                    set_cell_margins(r.cells[c_idx], top=8, bottom=8, left=40, right=40)
+
+            set_cell_shading(bottom_table.rows[0].cells[0], "F1F5F9")
+            write_cell(bottom_table.rows[0].cells[0], "SERVİS DIŞI İŞLEMLER (Elle Doldurulur)", bold=True, size=7.5)
+
+            ext_cell = bottom_table.rows[1].cells[0]
+            ext_cell.merge(bottom_table.rows[2].cells[0])
+            ext_cell.merge(bottom_table.rows[3].cells[0])
+            ext_text = (
+                "☐ Kaporta : ....................................................\n"
+                "☐ Boya : .........................................................\n"
+                "☐ Elektrik : ....................  ☐ Mekanik : ....................\n"
+                "☐ Rot / Balans : ............  ☐ Diğer : ........................"
+            )
+            write_cell(ext_cell, ext_text, bold=False, size=7.5)
+
+            sign_top = bottom_table.rows[0].cells[1]
+            sign_top.merge(bottom_table.rows[1].cells[1])
+            write_cell(sign_top, "ARACI TESLİM ALAN\nAd Soyad / İmza:\n", bold=True, size=7.5, align=WD_ALIGN_PARAGRAPH.CENTER)
+            sign_top.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+
+            sign_bot = bottom_table.rows[2].cells[1]
+            sign_bot.merge(bottom_table.rows[3].cells[1])
+            write_cell(sign_bot, "ARACI TESLİM EDEN\nAd Soyad / İmza:\n", bold=True, size=7.5, align=WD_ALIGN_PARAGRAPH.CENTER)
+            sign_bot.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+
+            parca_toplam = sum(p["tutar"] for p in self.data["parcalar"])
+            iscilik = self.data["iscilik"]
+            genel_toplam = round(parca_toplam + iscilik, 2)
+            kdv_li_fiyat = round(genel_toplam * 1.20, 2)
+
+            set_cell_shading(bottom_table.rows[0].cells[2], "F1F5F9")
+            write_cell(bottom_table.rows[0].cells[2], "YEDEK PARÇA TOPLAMI", bold=True, size=7.5)
+            write_cell(bottom_table.rows[0].cells[3], format_currency(parca_toplam), bold=True, size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+            set_cell_shading(bottom_table.rows[1].cells[2], "F1F5F9")
+            write_cell(bottom_table.rows[1].cells[2], "İŞÇİLİK TOPLAMI", bold=True, size=7.5)
+            write_cell(bottom_table.rows[1].cells[3], format_currency(iscilik), bold=True, size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+            set_cell_shading(bottom_table.rows[2].cells[2], "E2E8F0")
+            write_cell(bottom_table.rows[2].cells[2], "GENEL TOPLAM", bold=True, size=7.5)
+            set_cell_shading(bottom_table.rows[2].cells[3], "E2E8F0")
+            write_cell(bottom_table.rows[2].cells[3], format_currency(genel_toplam), bold=True, size=8, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+            set_cell_shading(bottom_table.rows[3].cells[2], "DBEAFE")
+            write_cell(bottom_table.rows[3].cells[2], "KDV (%20)'Lİ FİYAT", bold=True, size=7.5)
+            set_cell_shading(bottom_table.rows[3].cells[3], "DBEAFE")
+            write_cell(bottom_table.rows[3].cells[3], format_currency(kdv_li_fiyat), bold=True, size=8.5, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+            # 6. ALT BİLGİ YAZISI (16 Punto - Tek satıra sığması için Arial Narrow)
+            p_foot = doc.add_paragraph()
+            p_foot.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p_foot.paragraph_format.space_before = Pt(3)
+            p_foot.paragraph_format.space_after = Pt(2)
+            p_foot.paragraph_format.line_spacing = 1.0
+            r_foot = p_foot.add_run("AKDENİZ SAN. SİT. 5001 SOK. NO:114 KEPEZ/ANTALYA | ŞAHİN KIRICI – 0534 301 87 77")
+            r_foot.bold = True
+            r_foot.font.size = Pt(16)
+            r_foot.font.name = "Arial Narrow"
+
+            # 7. ALT BANNER LOGO (Tek sayfada kalacak ve alt boşluğu dolduracak ideal boyut: 190 mm x 31 mm)
+            bottom_logo_path = find_image_file([
+                "alt_logo.png", "alt_logo.jpg", "alt_logo.jpeg",
+                "logo.png", "logo.jpg", "logo.jpeg"
+            ])
+            if bottom_logo_path:
+                p_logo_bot = doc.add_paragraph()
+                p_logo_bot.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p_logo_bot.paragraph_format.space_before = Pt(1)
+                p_logo_bot.paragraph_format.space_after = Pt(0)
+                run_logo_bot = p_logo_bot.add_run()
+                run_logo_bot.add_picture(bottom_logo_path, width=mm(190), height=mm(31))
+
+            desktop_dir = get_desktop_path()
+            clean_musteri = sanitize_filename(self.data["musteri_adi"])
+            clean_tarih = sanitize_filename(self.data["teslim_tarihi"] or datetime.date.today().strftime("%d.%m.%Y"))
+            filename = f"IsEmri_{self.is_emri_no}_{clean_musteri}_{clean_tarih}.docx"
+            full_path = os.path.join(desktop_dir, filename)
+
+            doc.save(full_path)
+            self.son_kaydedilen_dosya = full_path
+
+            self.increment_and_save_order_no()
+            self.render_step()
+
+            messagebox.showinfo(
+                "Kayıt Başarılı",
+                f"Dosya masaüstüne kaydedildi:\n\n{full_path}"
+            )
+
+        except PermissionError:
+            messagebox.showerror(
+                "Dosya Açık Hatası",
+                "Kaydedilmeye çalışılan Word dosyası şu anda açık görünüyor. Lütfen Word dosyasını kapatıp tekrar deneyin."
+            )
+        except Exception as e:
+            messagebox.showerror("Kayıt Hatası", f"Word dosyası oluşturulurken bir hata meydana geldi:\n{e}")
+
+
+if __name__ == "__main__":
+    app = SahinOtomotivApp()
+    app.mainloop()
